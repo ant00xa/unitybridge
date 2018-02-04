@@ -11,18 +11,29 @@
 #import <QuartzCore/QuartzCore.h>
 #import <AssetsLibrary/AssetsLibrary.h>
 
-@interface ASScreenRecorder()
+@interface ASScreenRecorder()<AVCaptureAudioDataOutputSampleBufferDelegate>
 @property (strong, nonatomic) AVAssetWriter *videoWriter;
 @property (strong, nonatomic) AVAssetWriterInput *videoWriterInput;
 @property (strong, nonatomic) AVAssetWriterInputPixelBufferAdaptor *avAdaptor;
 @property (strong, nonatomic) CADisplayLink *displayLink;
 @property (strong, nonatomic) NSDictionary *outputBufferPoolAuxAttributes;
+
+@property (nonatomic) AVCaptureDeviceInput        *audioCaptureInput;
+@property (nonatomic) AVAssetWriterInput          *audioInput;
+@property (nonatomic) AVCaptureAudioDataOutput    *audioCaptureOutput;
+@property (nonatomic) AVCaptureSession            *captureSession;
+@property (nonatomic) NSDictionary                *audioSettings;
+
+@property (nonatomic) CMTime                      firstAudioTimeStamp;
+@property (nonatomic) NSDate                      *startedAt;
+
 @property (nonatomic) CFTimeInterval firstTimeStamp;
 @property (nonatomic) BOOL isRecording;
 @end
 
 @implementation ASScreenRecorder
 {
+    dispatch_queue_t _audio_capture_queue;
     dispatch_queue_t _render_queue;
     dispatch_queue_t _append_pixelBuffer_queue;
     dispatch_semaphore_t _frameRenderingSemaphore;
@@ -64,6 +75,7 @@
         dispatch_set_target_queue(_render_queue, dispatch_get_global_queue( DISPATCH_QUEUE_PRIORITY_HIGH, 0));
         _frameRenderingSemaphore = dispatch_semaphore_create(1);
         _pixelAppendSemaphore = dispatch_semaphore_create(1);
+        [self setUpAudioCapture];
     }
     return self;
 }
@@ -79,6 +91,7 @@
 - (BOOL)startRecording
 {
     if (!_isRecording) {
+        [_captureSession startRunning];
         [self setUpWriter];
         _isRecording = (_videoWriter.status == AVAssetWriterStatusWriting);
         _displayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(writeVideoFrame)];
@@ -90,6 +103,7 @@
 - (void)stopRecordingWithCompletion:(VideoCompletionBlock)completionBlock;
 {
     if (_isRecording) {
+        [_captureSession stopRunning];
         _isRecording = NO;
         [_displayLink removeFromRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
         [self completeRecordingSession:completionBlock];
@@ -138,8 +152,14 @@
     
     [_videoWriter addInput:_videoWriterInput];
     
+    _audioInput = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeAudio outputSettings:_audioSettings];
+    _audioInput.expectsMediaDataInRealTime = YES;
+    
+    NSParameterAssert([_videoWriter canAddInput:_audioInput]);
+    [_videoWriter addInput:_audioInput];
+    
     [_videoWriter startWriting];
-    [_videoWriter startSessionAtSourceTime:CMTimeMake(0, 1000)];
+    [_videoWriter startSessionAtSourceTime:_firstAudioTimeStamp];
 }
 
 - (CGAffineTransform)videoTransformForDeviceOrientation
@@ -163,18 +183,7 @@
 
 - (NSURL*)tempFileURL
 {
-    /*
-     NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
-     [formatter setDateFormat:@"ddMMyyyy_HHmmss"];
-     NSDate *currentDate = [NSDate date];
-     NSString *outputPathMiddle = [formatter stringFromDate:currentDate];
-     NSString *outputPathStart = [NSHomeDirectory() stringByAppendingPathComponent:@"tmp/vp_"];
-     NSString *outputPathEnd = @".mp4";
-     NSString *outputPath = [NSString stringWithFormat:@"%@%@%@", outputPathStart, outputPathMiddle, outputPathEnd];
-     */
-    
     NSString *outputPath = [NSHomeDirectory() stringByAppendingPathComponent:@"tmp/vp_temp.mp4"];
-    
     [self removeTempFilePath:outputPath];
     return [NSURL fileURLWithPath:outputPath];
 }
@@ -194,44 +203,47 @@
 {
     dispatch_async(_render_queue, ^{
         dispatch_sync(_append_pixelBuffer_queue, ^{
-            
-            [_videoWriterInput markAsFinished];
-            [_videoWriter finishWritingWithCompletionHandler:^{
+            dispatch_sync(_audio_capture_queue, ^{
+                [_audioInput markAsFinished];
+                [_videoWriterInput markAsFinished];
                 
-                void (^completion)(NSString*) = ^(NSString* videoUrl) {
-                    [self cleanup];
-                    dispatch_async(dispatch_get_main_queue(), ^{
-                        if (completionBlock) completionBlock(videoUrl);
-                    });
-                };
+                [_videoWriter finishWritingWithCompletionHandler:^{
+                    
+                    void (^completion)(NSString*) = ^(NSString* videoUrl) {
+                        [self cleanup];
+                        dispatch_async(dispatch_get_main_queue(), ^{
+                            if (completionBlock) completionBlock(videoUrl);
+                        });
+                    };
+                    
+                    
+                    if (self.videoURL) {
+                        completion(self.videoURL.absoluteString);
+                    } else {
+                        ALAssetsLibrary *library = [[ALAssetsLibrary alloc] init];
+                        [library writeVideoAtPathToSavedPhotosAlbum:_videoWriter.outputURL completionBlock:^(NSURL *assetURL, NSError *error) {
+                            
+                            NSFileManager* fileManager = [NSFileManager defaultManager];
+                            if ([fileManager fileExistsAtPath:_videoWriter.outputURL.path]) {
+                                NSDictionary *attrs = [fileManager attributesOfItemAtPath: _videoWriter.outputURL.path error: NULL];
+                                unsigned long long fSize = [attrs fileSize];
+                                NSLog(@"fileSize: %lld", fSize);
+                            }
+                            
+                            NSLog(@"assetURL: %@", assetURL);
+                            
+                            if (error) {
+                                NSLog(@"Error copying video to camera roll:%@", [error localizedDescription]);
+                            } else {
+                                //[self removeTempFilePath:_videoWriter.outputURL.path];
+                                completion([[[self videoWriter] outputURL] absoluteString]);
+                            }
+                        }];
+                    }
+
+                }];
                 
-                
-                if (self.videoURL) {
-                    completion(self.videoURL.absoluteString);
-                } else {
-                    ALAssetsLibrary *library = [[ALAssetsLibrary alloc] init];
-                    [library writeVideoAtPathToSavedPhotosAlbum:_videoWriter.outputURL completionBlock:^(NSURL *assetURL, NSError *error) {
-                        
-                        NSFileManager* fileManager = [NSFileManager defaultManager];
-                        if ([fileManager fileExistsAtPath:_videoWriter.outputURL.path]) {
-                            NSDictionary *attrs = [fileManager attributesOfItemAtPath: _videoWriter.outputURL.path error: NULL];
-                            unsigned long long fSize = [attrs fileSize];
-                            NSLog(@"fileSize: %lld", fSize);
-                        }
-                        
-                        NSLog(@"assetURL: %@", assetURL);
-                        
-                        if (error) {
-                            NSLog(@"Error copying video to camera roll:%@", [error localizedDescription]);
-                        } else {
-                            //[self removeTempFilePath:_videoWriter.outputURL.path];
-                            completion([[[self videoWriter] outputURL] absoluteString]);
-                        }
-                    }];
-                }
-                
-                
-            }];
+            });
         });
     });
 }
@@ -242,6 +254,10 @@
     self.videoWriterInput = nil;
     self.videoWriter = nil;
     self.firstTimeStamp = 0;
+    
+    self.startedAt = nil;
+    self.firstAudioTimeStamp = kCMTimeZero;
+    
     self.outputBufferPoolAuxAttributes = nil;
     CGColorSpaceRelease(_rgbColorSpace);
     CVPixelBufferPoolRelease(_outputBufferPool);
@@ -264,7 +280,7 @@
             self.firstTimeStamp = _displayLink.timestamp;
         }
         CFTimeInterval elapsed = (_displayLink.timestamp - self.firstTimeStamp);
-        CMTime time = CMTimeMakeWithSeconds(elapsed, 1000);
+        CMTime time = CMTimeAdd(_firstAudioTimeStamp, CMTimeMakeWithSeconds(elapsed, 1000));
         
         CVPixelBufferRef pixelBuffer = NULL;
         CGContextRef bitmapContext = [self createPixelBufferAndBitmapContext:&pixelBuffer];
@@ -325,6 +341,85 @@
     CGContextConcatCTM(bitmapContext, flipVertical);
     
     return bitmapContext;
+}
+
+# pragma mark - audio recording
+
+- (void)setUpAudioCapture
+{
+    NSError *error;
+    
+    AVCaptureDevice *device = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeAudio];
+    if (device && device.connected)
+        NSLog(@"Connected Device: %@", device.localizedName);
+    else
+    {
+        NSLog(@"AVCaptureDevice Failed");
+        return;
+    }
+    
+    // add device inputs
+    _audioCaptureInput = [AVCaptureDeviceInput deviceInputWithDevice:device error:&error];
+    if (!_audioCaptureInput)
+    {
+        NSLog(@"AVCaptureDeviceInput Failed");
+        return;
+    }
+    if (error)
+    {
+        NSLog(@"%@", error);
+        return;
+    }
+    
+    // add output for audio
+    _audioCaptureOutput = [[AVCaptureAudioDataOutput alloc] init];
+    if (!_audioCaptureOutput)
+    {
+        NSLog(@"AVCaptureMovieFileOutput Failed");
+        return;
+    }
+    
+    _audio_capture_queue = dispatch_queue_create("AudioCaptureQueue", NULL);
+    [_audioCaptureOutput setSampleBufferDelegate:self queue:_audio_capture_queue];
+    
+    _captureSession = [[AVCaptureSession alloc] init];
+    if (!_captureSession)
+    {
+        NSLog(@"AVCaptureSession Failed");
+        return;
+    }
+    _captureSession.sessionPreset = AVCaptureSessionPresetMedium;
+    if ([_captureSession canAddInput:_audioCaptureInput])
+        [_captureSession addInput:_audioCaptureInput];
+    else
+    {
+        NSLog(@"Failed to add input device to capture session");
+        return;
+    }
+    if ([_captureSession canAddOutput:_audioCaptureOutput])
+        [_captureSession addOutput:_audioCaptureOutput];
+    else
+    {
+        NSLog(@"Failed to add output device to capture session");
+        return;
+    }
+    
+    _audioSettings = [_audioCaptureOutput recommendedAudioSettingsForAssetWriterWithOutputFileType:AVFileTypeQuickTimeMovie];
+    
+    NSLog(@"Audio capture session running");
+}
+
+- (void)captureOutput:(AVCaptureOutput *)captureOutput didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer fromConnection:(AVCaptureConnection *)connection {
+    if (captureOutput == _audioCaptureOutput) {
+        if (_startedAt == nil) {
+            _startedAt = [NSDate date];
+            _firstAudioTimeStamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer);
+        }
+        
+        if (_isRecording && [_audioInput isReadyForMoreMediaData]) {
+            [_audioInput appendSampleBuffer:sampleBuffer];
+        }
+    }
 }
 //-----------------------------------------------------------------------------------------------------
 
