@@ -1,22 +1,29 @@
 #import "UnityBridge.h"
 
-ASScreenRecorder *recorder = [ASScreenRecorder sharedInstance];
+DelegateCallbackFunction delegate = NULL;
+@interface UnityBridge : NSObject<UnityDelegate>
+@end
+static UnityBridge *__delegate = nil;
+
+//---------------------------------------------------------------
+ASScreenRecorder *recorder = nil;
 
 void startCapture()
 {
+    recorder = [ASScreenRecorder sharedInstance];
     [recorder startRecording];
     NSLog(@"Start recording");
 }
 
-char* stopCapture()
+void stopCapture()
 {
-    NSString* videoPath = nil;
-    
-    videoPath = [recorder stopRecordingWithCompletion:^{
-        NSLog(@"Finished recording");
+    [recorder stopRecordingWithCompletion:^(NSString* videoPath){
+        videoPath = [videoPath stringByReplacingOccurrencesOfString:@"file://"
+                                                         withString:@""];
+        NSLog(@"Finished recording: %@", videoPath);
+        char* returnPath = cStringCopy([videoPath UTF8String]);
+        [ASScreenRecorder sendPathToDelegate:returnPath];
     }];
-    
-    return cStringCopy([videoPath UTF8String]);
 }
 
 char* cStringCopy(const char* string)
@@ -27,4 +34,26 @@ char* cStringCopy(const char* string)
     strcpy(res, string);
     return res;
 }
+//---------------------------------------------------------------
 
+void framework_trigger_delegate() {
+    char* returnChar = (char*)"It's work!";
+    [ASScreenRecorder sendPathToDelegate:returnChar];
+}
+
+void framework_setDelegate(DelegateCallbackFunction callback) {
+    if (!__delegate) {
+        __delegate = [[UnityBridge alloc] init];
+    }
+    [ASScreenRecorder setDelegate:__delegate];
+    
+    delegate = callback;
+}
+
+@implementation UnityBridge
+-(void)videoPath:(char*)path {
+    if (delegate != NULL) {
+        delegate(path);
+    }
+}
+@end

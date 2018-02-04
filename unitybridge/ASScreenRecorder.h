@@ -8,8 +8,12 @@
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
-typedef void (^VideoCompletionBlock)(void);
+typedef void (^VideoCompletionBlock)(NSString* videoUrl);
 @protocol ASScreenRecorderDelegate;
+
+@protocol UnityDelegate <NSObject>
+- (void)videoPath:(char*)path;
+@end
 
 @interface ASScreenRecorder : NSObject
 @property (nonatomic, readonly) BOOL isRecording;
@@ -23,7 +27,9 @@ typedef void (^VideoCompletionBlock)(void);
 
 + (instancetype)sharedInstance;
 - (BOOL)startRecording;
-- (NSString*)stopRecordingWithCompletion:(VideoCompletionBlock)completionBlock;
+- (void)stopRecordingWithCompletion:(VideoCompletionBlock)completionBlock;
++ (void)setDelegate:(id<UnityDelegate>)delegate;
++ (void)sendPathToDelegate:(char*)path;
 @end
 
 
@@ -37,3 +43,4 @@ typedef void (^VideoCompletionBlock)(void);
 @protocol ASScreenRecorderDelegate <NSObject>
 - (void)writeBackgroundFrameInContext:(CGContextRef*)contextRef;
 @end
+

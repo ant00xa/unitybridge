@@ -87,24 +87,20 @@
     return _isRecording;
 }
 
-- (NSString*)stopRecordingWithCompletion:(VideoCompletionBlock)completionBlock;
+- (void)stopRecordingWithCompletion:(VideoCompletionBlock)completionBlock;
 {
-    __block NSString* filePath = nil;
-    
     if (_isRecording) {
         _isRecording = NO;
         [_displayLink removeFromRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
-        filePath = [self completeRecordingSession:completionBlock];
+        [self completeRecordingSession:completionBlock];
+        dispatch_semaphore_signal(_frameRenderingSemaphore);
     }
-    
-    return filePath;
 }
 
 #pragma mark - private
 
 -(void)setUpWriter
 {
-    //NSLog(@"viewSize: %f, %f", _viewSize.width, _viewSize.height);
     _rgbColorSpace = CGColorSpaceCreateDeviceRGB();
     
     NSDictionary *bufferAttributes = @{(id)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_32BGRA),
@@ -167,7 +163,18 @@
 
 - (NSURL*)tempFileURL
 {
-    NSString *outputPath = [NSHomeDirectory() stringByAppendingPathComponent:@"tmp/screenCapture.mp4"];
+    /*
+     NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
+     [formatter setDateFormat:@"ddMMyyyy_HHmmss"];
+     NSDate *currentDate = [NSDate date];
+     NSString *outputPathMiddle = [formatter stringFromDate:currentDate];
+     NSString *outputPathStart = [NSHomeDirectory() stringByAppendingPathComponent:@"tmp/vp_"];
+     NSString *outputPathEnd = @".mp4";
+     NSString *outputPath = [NSString stringWithFormat:@"%@%@%@", outputPathStart, outputPathMiddle, outputPathEnd];
+     */
+    
+    NSString *outputPath = [NSHomeDirectory() stringByAppendingPathComponent:@"tmp/vp_temp.mp4"];
+    
     [self removeTempFilePath:outputPath];
     return [NSURL fileURLWithPath:outputPath];
 }
@@ -183,40 +190,42 @@
     }
 }
 
-- (NSString*)completeRecordingSession:(VideoCompletionBlock)completionBlock;
+- (void)completeRecordingSession:(VideoCompletionBlock)completionBlock;
 {
-    __block NSString* filePath = @"private/var/mobile/Containers/Data/Application/1AE8E200-FB5C-4F41-8515-51B82D7E5AB6/tmp/screenCapture.mp4";
-    
     dispatch_async(_render_queue, ^{
         dispatch_sync(_append_pixelBuffer_queue, ^{
             
             [_videoWriterInput markAsFinished];
             [_videoWriter finishWritingWithCompletionHandler:^{
                 
-                void (^completion)(void) = ^() {
+                void (^completion)(NSString*) = ^(NSString* videoUrl) {
                     [self cleanup];
                     dispatch_async(dispatch_get_main_queue(), ^{
-                        if (completionBlock) completionBlock();
+                        if (completionBlock) completionBlock(videoUrl);
                     });
                 };
                 
                 
-                
                 if (self.videoURL) {
-                    completion();
+                    completion(self.videoURL.absoluteString);
                 } else {
                     ALAssetsLibrary *library = [[ALAssetsLibrary alloc] init];
                     [library writeVideoAtPathToSavedPhotosAlbum:_videoWriter.outputURL completionBlock:^(NSURL *assetURL, NSError *error) {
                         
-                        NSLog(@"outPath: %@", _videoWriter.outputURL.path);
+                        NSFileManager* fileManager = [NSFileManager defaultManager];
+                        if ([fileManager fileExistsAtPath:_videoWriter.outputURL.path]) {
+                            NSDictionary *attrs = [fileManager attributesOfItemAtPath: _videoWriter.outputURL.path error: NULL];
+                            unsigned long long fSize = [attrs fileSize];
+                            NSLog(@"fileSize: %lld", fSize);
+                        }
+                        
                         NSLog(@"assetURL: %@", assetURL);
-                        filePath = _videoWriter.outputURL.path;
                         
                         if (error) {
                             NSLog(@"Error copying video to camera roll:%@", [error localizedDescription]);
                         } else {
-                            [self removeTempFilePath:_videoWriter.outputURL.path];
-                            completion();
+                            //[self removeTempFilePath:_videoWriter.outputURL.path];
+                            completion([[[self videoWriter] outputURL] absoluteString]);
                         }
                     }];
                 }
@@ -225,8 +234,6 @@
             }];
         });
     });
-    
-    return filePath;
 }
 
 - (void)cleanup
@@ -247,8 +254,11 @@
     if (dispatch_semaphore_wait(_frameRenderingSemaphore, DISPATCH_TIME_NOW) != 0) {
         return;
     }
+    
     dispatch_async(_render_queue, ^{
-        if (![_videoWriterInput isReadyForMoreMediaData]) return;
+        if (![_videoWriterInput isReadyForMoreMediaData]) {
+            return;
+        }
         
         if (!self.firstTimeStamp) {
             self.firstTimeStamp = _displayLink.timestamp;
@@ -316,5 +326,20 @@
     
     return bitmapContext;
 }
+//-----------------------------------------------------------------------------------------------------
+
+id __delegate = nil;
+
++ (void)sendPathToDelegate:(char*)path
+{
+    if (__delegate && [__delegate respondsToSelector:@selector(videoPath:)]) {
+        [__delegate videoPath:path];
+    }
+}
+
++ (void)setDelegate:(id<UnityDelegate>)delegate {
+    __delegate = delegate;
+}
 
 @end
+
